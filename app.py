@@ -5,11 +5,12 @@
 # =====================================================================
 
 import sqlite3
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+from flask import Flask, render_template_string, request, redirect, url_for, flash, jsonify
 from grades import DB_FILE, Student, GradeManager
 
 app = Flask(__name__)
 app.secret_key = "vibe-lab-grades-secret-key"
+app.config["DB_FILE"] = DB_FILE
 
 # 최초 실행 시 테이블 생성 및 CSV 마이그레이션 보장
 _init_mgr = GradeManager(DB_FILE)
@@ -17,7 +18,8 @@ _init_mgr.close()
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    db_path = app.config.get("DB_FILE", DB_FILE)
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -941,6 +943,192 @@ def delete_student(name):
     conn.close()
     flash(f"'{name}' 학생 정보가 삭제되었습니다.", "info")
     return redirect(url_for("index"))
+
+
+# =====================================================================
+# JSON REST API 엔드포인트 (/api/students, /api/statistics)
+# =====================================================================
+
+def _student_to_api_dict(student: Student):
+    return {
+        "name": student.name,
+        "korean": student.korean,
+        "english": student.english,
+        "math": student.math,
+        "average": round(student.average, 2),
+        "grade": student.grade,
+        "status": student.status,
+    }
+
+
+def _validate_student_payload(data, require_name=True):
+    if not isinstance(data, dict):
+        return None, "요청 본문은 JSON 객체여야 합니다."
+
+    name = str(data.get("name", "")).strip() if require_name else None
+    if require_name and not name:
+        return None, "name 필드는 필수입니다."
+
+    try:
+        kor = int(data["korean"])
+        eng = int(data["english"])
+        mat = int(data["math"])
+    except (KeyError, TypeError, ValueError):
+        return None, "korean, english, math 점수는 정수여야 합니다."
+
+    if not (0 <= kor <= 100 and 0 <= eng <= 100 and 0 <= mat <= 100):
+        return None, "점수는 0에서 100 사이여야 합니다."
+
+    return {"name": name, "korean": kor, "english": eng, "math": mat}, None
+
+
+@app.route("/api/students", methods=["GET"])
+def api_list_students():
+    """전체 학생 목록 조회 (검색 q, 등급 grade, 판정 status 필터 지원)"""
+    q = request.args.get("q", "").strip().lower()
+    grade_filter = request.args.get("grade", "").strip().upper()
+    status_filter = request.args.get("status", "").strip()
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, korean, english, math, (korean + english + math) / 3.0 AS avg
+        FROM students
+        ORDER BY avg DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    students = [Student(r["name"], r["korean"], r["english"], r["math"]) for r in rows]
+    if q:
+        students = [s for s in students if q in s.name.lower()]
+    if grade_filter:
+        students = [s for s in students if s.grade == grade_filter]
+    if status_filter:
+        if status_filter.lower() == "pass":
+            students = [s for s in students if s.status == "Pass"]
+        elif status_filter.lower() == "fail":
+            students = [s for s in students if s.status.startswith("Fail")]
+
+    return jsonify({
+        "count": len(students),
+        "students": [_student_to_api_dict(s) for s in students],
+    }), 200
+
+
+@app.route("/api/students/<name>", methods=["GET"])
+def api_get_student(name):
+    """단일 학생 성적 조회"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, korean, english, math FROM students WHERE name = ?", (name,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": f"'{name}' 학생을 찾을 수 없습니다."}), 404
+
+    student = Student(row["name"], row["korean"], row["english"], row["math"])
+    return jsonify(_student_to_api_dict(student)), 200
+
+
+@app.route("/api/students", methods=["POST"])
+def api_create_student():
+    """학생 성적 등록 (또는 덮어쓰기)"""
+    data = request.get_json(silent=True)
+    parsed, err = _validate_student_payload(data, require_name=True)
+    if err:
+        return jsonify({"error": err}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO students (name, korean, english, math) VALUES (?, ?, ?, ?)",
+        (parsed["name"], parsed["korean"], parsed["english"], parsed["math"]),
+    )
+    conn.commit()
+    conn.close()
+
+    student = Student(parsed["name"], parsed["korean"], parsed["english"], parsed["math"])
+    return jsonify(_student_to_api_dict(student)), 201
+
+
+@app.route("/api/students/<name>", methods=["PUT"])
+def api_update_student(name):
+    """특정 학생 성적 수정"""
+    data = request.get_json(silent=True)
+    parsed, err = _validate_student_payload(data, require_name=False)
+    if err:
+        return jsonify({"error": err}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM students WHERE name = ?", (name,))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({"error": f"'{name}' 학생을 찾을 수 없습니다."}), 404
+
+    cur.execute(
+        "UPDATE students SET korean = ?, english = ?, math = ? WHERE name = ?",
+        (parsed["korean"], parsed["english"], parsed["math"], name),
+    )
+    conn.commit()
+    conn.close()
+
+    student = Student(name, parsed["korean"], parsed["english"], parsed["math"])
+    return jsonify(_student_to_api_dict(student)), 200
+
+
+@app.route("/api/students/<name>", methods=["DELETE"])
+def api_delete_student(name):
+    """특정 학생 삭제"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM students WHERE name = ?", (name,))
+    if not cur.fetchone():
+        conn.close()
+        return jsonify({"error": f"'{name}' 학생을 찾을 수 없습니다."}), 404
+
+    cur.execute("DELETE FROM students WHERE name = ?", (name,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": f"'{name}' 학생이 삭제되었습니다."}), 200
+
+
+@app.route("/api/statistics", methods=["GET"])
+def api_statistics():
+    """전체 과목별 통계 및 등급/합격률 JSON 반환"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, korean, english, math FROM students")
+    rows = cur.fetchall()
+    students = [Student(r["name"], r["korean"], r["english"], r["math"]) for r in rows]
+    total = len(students)
+
+    subjects = {}
+    for key, col in [("korean", "korean"), ("english", "english"), ("math", "math")]:
+        if total > 0:
+            cur.execute(f"SELECT AVG({col}), MAX({col}), MIN({col}) FROM students")
+            avg_val, max_val, min_val = cur.fetchone()
+            subjects[key] = {"average": round(avg_val, 2), "max": max_val, "min": min_val}
+        else:
+            subjects[key] = {"average": 0.0, "max": 0, "min": 0}
+
+    conn.close()
+
+    pass_count = sum(1 for s in students if s.status == "Pass")
+    fail_count = total - pass_count
+    pass_rate = round(pass_count / total * 100, 1) if total > 0 else 0.0
+    grade_distribution = {g: sum(1 for s in students if s.grade == g) for g in ["A", "B", "C", "D", "F"]}
+
+    return jsonify({
+        "total": total,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "pass_rate": pass_rate,
+        "subjects": subjects,
+        "grade_distribution": grade_distribution,
+    }), 200
 
 
 if __name__ == "__main__":
